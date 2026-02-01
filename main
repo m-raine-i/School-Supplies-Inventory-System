@@ -1,0 +1,1050 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from PIL import Image, ImageTk
+from barcode.writer import ImageWriter
+from fpdf import FPDF
+from cryptography.fernet import Fernet
+import psycopg2, barcode, os, shutil, hashlib, re, uuid, webbrowser, json, sys, subprocess, platform
+
+#   COLOR SCHEME
+colors = {
+    'header': '#A1BC98',
+    'bg_light': '#F1F3E0',
+    'bg_dark': '#D2DCB6',
+    'btn_green': '#3B5249',
+    'btn_blue': '#22577A',
+    'btn_red': '#8C271E',
+    'btn_white': '#6B6D76',
+    'btn_orange': '#FFB20F',
+    'accent_yellow': '#778873',
+    'text_color': '#222725'
+}
+
+#   CHECKI IF PSQL IS INSTALLED IN DIFFERENT OS
+def is_postgres_installed():
+    system = platform.system()
+    try:
+        result = subprocess.run(['psql', '--version'], capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+
+    except FileNotFoundError:
+        pass
+
+    # MAKES SURE TO CHECK SERVICES.MSC FOR PSQL IF IT IS NOT IN PATH/ ENVIRONMENT VARIABLES
+    if system == 'Windows':
+        try:
+            svc = subprocess.run(
+                ['sc', 'query', 'type=', 'service', 'state=', 'all'],
+                capture_output=True,
+                text=True,
+                shell=False
+            )
+            output = svc.stdout.lower()
+            if 'postgresql' in output or 'postgres' in output:
+                return True
+
+        except Exception:
+            pass
+
+    return False
+
+#   REDIRECTS USER TO THE DOWNLOADS PAGE
+def redirect_postgres_download():
+    webbrowser.open('https://www.postgresql.org/download/windows/')
+    messagebox.showerror('PostgreSQL Not Found','PostgreSQL is required.\nYou will now be directed to the downloads page.')
+    sys.exit()
+
+#   FOR THE ENCRYPTED .JSON FILE THAT CONTAINS PG ADMIN/ POSTGRESQL CREDENTIALS
+app_dir = os.path.join(os.getenv('APPDATA'), 'SchoolSuppliesInventory')
+os.makedirs(app_dir, exist_ok=True)
+key_file = os.path.join(app_dir, 'key.key')
+config_file = os.path.join(app_dir, 'db_config.json')
+
+#   GENERATES KEY FOR THE ENCRYPTED .JSON
+def generate_key():
+    key = Fernet.generate_key()
+    with open(key_file, 'wb') as f:
+        f.write(key)
+    return key
+
+def load_key():
+    if not os.path.exists(key_file):
+        return generate_key()
+    with open(key_file, 'rb') as f:
+        return f.read()
+
+#   ENCRYPTS THE DB_CONFIG.JSON FOR SECURITY
+def encrypt_config(config: dict):
+    key = load_key()
+    fernet = Fernet(key)
+    json_bytes = json.dumps(config).encode('utf-8')
+    encrypted = fernet.encrypt(json_bytes)
+    with open(config_file, 'wb') as f:
+        f.write(encrypted)
+
+def load_db_config_encrypted():
+    if not os.path.exists(config_file):
+        return None
+    key = load_key()
+    fernet = Fernet(key)
+    encrypted = open(config_file, 'rb').read()
+    try:
+        decrypted_bytes = fernet.decrypt(encrypted)
+    except Exception as e:
+        raise RuntimeError("Failed to decrypt DB config. It may be corrupted.") from e
+    return json.loads(decrypted_bytes)
+
+#   GUI WINDOW TO INPUT POSTGRESQL PASSWORD
+def ask_db_credentials(parent):
+    win = tk.Toplevel(parent)
+    win.title('PostgreSQL Setup')
+    win.geometry('400x400')
+    win.configure(bg=colors['bg_light'])
+    win.resizable(True, True)
+
+    host = tk.StringVar(value='localhost')
+    port = tk.StringVar(value='5432')
+    user = tk.StringVar(value='postgres')
+    password = tk.StringVar()
+
+    #   HEADER FRAME
+    header_frame = tk.Frame(win, bg=colors['header'], height=60)
+    header_frame.pack(fill='x', pady=(0, 20))
+    header_label = tk.Label(header_frame, text='PostgreSQL Setup', font=('Arial', 20, 'bold'), bg=colors['header'], fg=colors['text_color'], pady=15)
+    header_label.pack()
+
+    tk.Label(win, text='Host:', font=('Arial', 12), bg=colors['bg_light']).pack()
+    host_entry = tk.Entry(win, font=('Arial', 12), textvariable=host)
+    host_entry.pack()
+
+    tk.Label(win, text='Port:', font=('Arial', 12), bg=colors['bg_light']).pack()
+    host_entry = tk.Entry(win, font=('Arial', 12), textvariable=port)
+    host_entry.pack()
+
+    tk.Label(win, text='User:', font=('Arial', 12), bg=colors['bg_light']).pack()
+    host_entry = tk.Entry(win, font=('Arial', 12), textvariable=user)
+    host_entry.pack()
+
+    tk.Label(win, text='Password:', font=('Arial', 12), bg=colors['bg_light']).pack()
+    password_entry = tk.Entry(win, show='*', font=('Arial', 12), textvariable=password)
+    password_entry.pack()
+
+    def save_credentials():
+        if not host.get().strip() or not port.get().strip() or not user.get().strip() or not password.get().strip():
+            messagebox.showwarning('Missing Fields', 'All fields are required.')
+            return
+
+        try:
+            cfg = {
+                'host': host.get().strip(),
+                'port': port.get().strip(),
+                'user': user.get().strip(),
+                'password': password.get().strip()
+            }
+            encrypt_config(cfg)
+            messagebox.showinfo('Credentials Stored', 'Database credentials saved successfully!')
+            win.destroy()
+        except Exception as e:
+            messagebox.showerror('Error', str(e))
+
+    tk.Button(win, text='Save & Continue', width=15, height=2, bg=colors['btn_green'], activebackground=colors['accent_yellow'], fg='white', font=('Arial', 12), command=save_credentials).pack(pady=(50, 10))
+    win.transient(parent)
+    win.grab_set()
+    parent.wait_window(win)
+
+#   CONNECTS TO PSQL SERVER USING THE PASSWORD
+def get_db_connection(dbname='schoolsupplies_inventory'):
+    cfg = load_db_config_encrypted()
+    if not cfg:
+        raise RuntimeError('Database configuration missing. Run startup() first.')
+    return psycopg2.connect(
+        host=cfg['host'],
+        port=cfg['port'],
+        user=cfg['user'],
+        password=cfg['password'],
+        database=dbname
+    )
+
+#   ONCE PASSWORD IS CORRECT, IT AUTOMATICALLY CREATES THE DB AND TABLES IF THOSE DOES NOT EXIST YET
+def setup_database():
+    cfg = load_db_config_encrypted()
+
+    conn = psycopg2.connect(
+        host=cfg['host'],
+        port=cfg['port'],
+        user=cfg['user'],
+        password=cfg['password'],
+        database='postgres'
+    )
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    cur.execute("SELECT 1 FROM pg_database WHERE datname='schoolsupplies_inventory'")
+    if not cur.fetchone():
+        cur.execute("CREATE DATABASE schoolsupplies_inventory")
+
+    cur.close()
+    conn.close()
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS admin (
+            admin_id SERIAL PRIMARY KEY,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            first_name VARCHAR(255),
+            last_name VARCHAR(255),
+            department VARCHAR(255),
+            password VARCHAR(255) NOT NULL
+        )
+    ''')
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS items (
+            item_id SERIAL PRIMARY KEY,
+            item_name TEXT,
+            category TEXT,
+            quantity INTEGER,
+            unit_price NUMERIC(10,2),
+            barcode_value BIGINT UNIQUE,
+            barcode TEXT,
+            item_image TEXT
+        )
+    ''')
+
+    cur.execute('''
+        CREATE SEQUENCE IF NOT EXISTS barcode_seq
+        START 100000000000
+    ''')
+
+    conn.commit()
+    conn.close()
+
+#   THIS HAPPENS ONCE USER OPENS THE .EXE FILE/ APPLICATION
+def startup(root):
+    if not is_postgres_installed():
+        redirect_postgres_download()
+        return
+
+    if not load_db_config_encrypted():
+        ask_db_credentials(root)
+
+    setup_database()
+
+#   SHA256 HASH
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+#   REGISTER
+class RegisterAdmin:
+    def __init__(self, root):
+        self.root = root
+        self.root.title('Register Admin')
+        self.root.geometry('400x450')
+        root.configure(bg=colors['bg_light'])
+        self.root.resizable(True, True)
+
+        #   HEADER FRAME
+        header_frame = tk.Frame(self.root, bg=colors['header'], height=60)
+        header_frame.pack(fill='x')
+        header_label = tk.Label(
+            header_frame,
+            text='Register New Admin',
+            font=('Arial', 20, 'bold'),
+            bg=colors['header'],
+            fg=colors['text_color'],
+            pady=15
+        )
+        header_label.pack()
+
+        tk.Label(root, text='First Name:', font=('Arial', 12), bg=colors['bg_light']).pack()
+        self.first_name_entry = tk.Entry(root, font=('Arial', 12))
+        self.first_name_entry.pack()
+
+        tk.Label(root, text='Last Name:', font=('Arial', 12), bg=colors['bg_light']).pack()
+        self.last_name_entry = tk.Entry(root, font=('Arial', 12))
+        self.last_name_entry.pack()
+
+        tk.Label(root, text='Email:', font=('Arial', 12), bg=colors['bg_light']).pack()
+        self.email_entry = tk.Entry(root, font=('Arial', 12))
+        self.email_entry.pack()
+
+        #   DROPDOWN FOR DEPARTMENT
+        dept_options = ['IT', 'Finance', 'Human Resource', 'Marketing', 'Sales', 'Production']
+        self.department_var = tk.StringVar()
+        self.department_var.set('Select Department')
+        dept_label = tk.Label(root, text='Department: ', bg=colors['bg_light'], font=('Arial', 12))
+        dept_label.pack()
+        dropdown = tk.OptionMenu(root, self.department_var, *dept_options)
+        dropdown.pack()
+        dropdown.config(width=15, font=('Arial', 12), activebackground=colors['accent_yellow'], activeforeground='white', highlightbackground=colors['bg_dark'], highlightthickness=1)
+        dropdown['menu'].config(font=('Arial', 12), activebackground=colors['accent_yellow'], activeforeground='white', background=colors['bg_dark'], fg=colors['text_color'])
+
+        tk.Label(root, text='Password:', font=('Arial', 12), bg=colors['bg_light']).pack()
+        self.password_entry = tk.Entry(root, show='*', font=('Arial', 12))
+        self.password_entry.pack()
+
+        tk.Label(root, text='Confirm Password:', font=('Arial', 12), bg=colors['bg_light']).pack()
+        self.confirm_entry = tk.Entry(root, show='*', font=('Arial', 12))
+        self.confirm_entry.pack()
+
+        check_pass = tk.Checkbutton(root, text='Show Password', font=('Arial', 12), bg=colors['bg_light'], command=self.show_pass)
+        check_pass.pack()
+
+        tk.Button(root, text='Create Account', bg=colors['btn_blue'], fg='white', font=('Arial', 12), command=self.register).pack(pady=15)
+
+    #   REGISTER COMMAND
+    def register(self):
+        first_name = self.first_name_entry.get()
+        last_name = self.last_name_entry.get()
+        email = self.email_entry.get().strip()
+        department = self.department_var.get()
+        password = self.password_entry.get()
+        confirm = self.confirm_entry.get()
+
+        if not self.validate_email(email):
+            messagebox.showerror('Invalid Input', 'Email must contain \'@\' and \'.\' characters.')
+            return
+
+        if not first_name or not last_name or not email or department == 'Select Department' or not password or not confirm:
+            messagebox.showwarning('Error', 'All fields are required.')
+            return
+
+        if password != confirm:
+            messagebox.showwarning('Error', 'Credentials do not match.')
+            return
+
+        hashed_pw = hash_password(password)
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        try:
+            cur.execute('''INSERT INTO admin (first_name, last_name, email, department, password) VALUES (%s, %s, %s, %s, %s)''',
+                      (
+                          first_name,
+                          last_name,
+                          email,
+                          department,
+                          hashed_pw
+                       ))
+            conn.commit()
+
+            messagebox.showinfo('Success!', f'{first_name} {last_name} registered successfully.')
+            self.root.destroy()
+            self.root.master.deiconify()
+
+        except psycopg2.IntegrityError:
+            messagebox.showerror('Error', 'Admin already exists.')
+
+        conn.close()
+
+    #   EMAIL VALIDATION
+    def validate_email(self, value):
+        email_pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
+        if re.match(email_pattern, value):
+            return True
+        return False
+
+    #   SHOW PASSWORD COMMAND
+    def show_pass(self):
+        if self.password_entry.cget('show') == '*' and self.confirm_entry.cget('show') == '*':
+            self.password_entry.config(show='')
+            self.confirm_entry.config(show='')
+        else:
+            self.password_entry.config(show='*')
+            self.confirm_entry.config(show='*')
+
+#   LOGIN
+class LoginAdmin:
+    def __init__(self, root, on_success):
+        self.root = root
+        self.root.title('Login Admin')
+        self.root.geometry('350x350')
+        root.configure(bg=colors['bg_light'])
+        self.root.resizable(True, True)
+
+        self.on_success = on_success
+
+        #   HEADER FRAME
+        header_frame = tk.Frame(self.root, bg=colors['header'], height=60)
+        header_frame.pack(fill='x', pady=(0,20))
+        header_label = tk.Label(header_frame, text='Login Admin', font=('Arial', 20, 'bold'), bg=colors['header'], fg=colors['text_color'], pady=15)
+        header_label.pack()
+
+        tk.Label(root, text='Email:', font=('Arial', 12), bg=colors['bg_light']).pack()
+        self.email_entry = tk.Entry(root, font=('Arial', 12))
+        self.email_entry.pack()
+
+        tk.Label(root, text='Password:', font=('Arial', 12), bg=colors['bg_light']).pack()
+        self.password_entry = tk.Entry(root, show='*', font=('Arial', 12))
+        self.password_entry.pack()
+
+        check_pass = tk.Checkbutton(root, text='Show Password', font=('Arial', 12), bg=colors['bg_light'], command=self.show_pass)
+        check_pass.pack()
+
+        tk.Button(root, text='Login', width=10, bg=colors['btn_green'], activebackground=colors['accent_yellow'], fg='white', font=('Arial', 12), command=self.login).pack(pady=(50,10))
+        tk.Button(root, text='Register', width=10, bg=colors['btn_blue'], activebackground=colors['accent_yellow'], fg='white', font=('Arial', 12), command=self.register).pack()
+
+    #   LOGIN COMMAND
+    def login(self):
+        password = self.password_entry.get()
+        hashed_pw = hash_password(password)
+        email = self.email_entry.get().strip()
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute('''SELECT first_name, last_name FROM admin WHERE email=%s AND password=%s''',(email, hashed_pw))
+        admin = cur.fetchone()
+
+        conn.close()
+
+        if not self.validate_email(email):
+            messagebox.showerror('Invalid Input','Email must contain \'@\' and \'.\' characters.')
+            return
+
+        if admin:
+            first_name, last_name = admin
+            messagebox.showinfo('Login Success!', f'Welcome, {first_name} {last_name}!')
+            self.on_success(first_name, last_name)
+
+        else:
+            messagebox.showerror('Error', 'Invalid email or password')
+
+    def on_register_close(self, reg_root):
+        reg_root.destroy()
+        self.root.deiconify()
+
+    def register(self):
+        self.root.withdraw()
+
+        reg_root = tk.Toplevel(self.root)
+        RegisterAdmin(reg_root)
+
+        reg_root.protocol('WM_DELETE_WINDOW', lambda: self.on_register_close(reg_root))
+
+    #   EMAIL VALIDATION
+    def validate_email(self, value):
+        email_pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
+        if re.match(email_pattern, value):
+            return True
+        return False
+
+    #   SHOW PASSWORD COMMAND
+    def show_pass(self):
+        if self.password_entry.cget('show') == '*':
+            self.password_entry.config(show='')
+        else:
+            self.password_entry.config(show='*')
+
+#   FILE PATH FOR BARCODE AND ITEM IMAGES
+barcode_dir = os.path.join(app_dir, 'barcodes')
+os.makedirs(barcode_dir, exist_ok=True)
+
+img_dir = os.path.join(app_dir, 'item_images')
+os.makedirs(img_dir, exist_ok=True)
+
+class SchoolSuppliesInventorySystem:
+    def __init__(self, root, first_name, last_name):
+        self.root = root
+        self.root.title('School Supplies Inventory System')
+        self.root.geometry('1500x700')
+        root.configure(bg='#F1F3E0')
+        self.root.resizable(True, True)
+
+        self.first_name = first_name
+        self.last_name = last_name
+
+        self.create_widgets()
+
+    #   SPINBOX VALIDATION INT VALUE
+    def validate_spinbox_input(self, value):
+        if value.isdigit() or value == '':
+            return True
+        else:
+            return False
+
+    #   UNIT PRICE VALIDATION FLOAT VALUE
+    def validate_price_input(self, value):
+        if value == '':
+            return True
+        try:
+            float(value)
+            return True
+        except ValueError:
+            return False
+
+    def create_widgets(self):
+
+        #   HEADER FRAME
+        header_frame = tk.Frame(self.root, bg=colors['header'], height=60)
+        header_frame.pack(fill='x')
+
+        header_label = tk.Label(header_frame, text='School Supplies Inventory System', font=('Arial', 20, 'bold'), bg=colors['header'], fg=colors['text_color'], pady=15)
+        header_label.pack(side='left' ,anchor='center', expand=True)
+
+        #   LAST_NAME CALL AND LOGOUT BUTTON
+        tk.Button(header_frame, text='Logout', bg=colors['btn_red'], fg='white', width=10, height=1, font=('Arial', 12), activebackground=colors['accent_yellow'], activeforeground='white', command=self.logout).pack(side='right', padx=(0, 20))
+        tk.Label(header_frame, text=f'Logged in as {self.last_name}', bg=colors['header'], fg=colors['text_color'], font=('Arial', 12, 'bold')).pack(side='right', padx=(0, 20))
+
+        #   TO EASILY SEPARATE LEFT AND RIGHT FRAMES
+        main_frame = tk.Frame(self.root)
+        main_frame.pack(fill='both', expand=True)
+
+        #   LEFT FRAME
+        left_frame = tk.Frame(main_frame, bg=colors['bg_dark'])
+        left_frame.pack(side='left', fill='y')
+
+        #   INPUT FRAME
+        input_label = tk.Label(left_frame, text='Enter Item Details', bg=colors['bg_dark'], fg=colors['text_color'], font=('Arial', 14, 'bold'))
+        input_label.pack(fill='x', pady=10)
+        input_frame = tk.Frame(left_frame, bg=colors['bg_dark'], padx=20)
+        input_frame.pack(fill='both', expand=True)
+
+        self.item_id_var = tk.StringVar()
+
+        #   ITEM NAME ENTRY FIELD
+        self.item_name_var = tk.StringVar()
+        name_label = tk.Label(input_frame, text='Item Name: ', font=('Arial', 12), bg=colors['bg_dark'], fg=colors['text_color'])
+        name_label.grid(row=1, column=0, sticky='w', padx=(0, 130), pady=10)
+        name_entry = tk.Entry(input_frame, textvariable=self.item_name_var, font=('Arial', 12), width=30)
+        name_entry.grid(row=1, column=0, sticky='ew', padx=(140, 5), pady=10, ipady=5)
+
+        #   FOR DROPDOWN OF CATEGORY
+        category_options = ['Arts and Crafts', 'Bond Paper', 'Math', 'Notebooks', 'Office', 'Organizers', 'Pens and Pencils']
+        self.category_var = tk.StringVar()
+        self.category_var.set('Select Category')
+        category_label = tk.Label(input_frame, text='Category: ', bg=colors['bg_dark'], font=('Arial', 12), fg=colors['text_color'])
+        category_label.grid(row=2, column=0, sticky='w', padx=(0, 5), pady=8)
+        dropdown = tk.OptionMenu(input_frame, self.category_var, *category_options)
+        dropdown.config(width=20, font=('Arial', 12), activebackground=colors['accent_yellow'], activeforeground='white', highlightbackground=colors['bg_dark'], highlightthickness=1)
+        dropdown['menu'].config(font=('Arial', 12), activebackground=colors['accent_yellow'], activeforeground='white', background=colors['bg_dark'], fg=colors['text_color'])
+        dropdown.grid(row=2, column=0, padx=140, pady=8, sticky='w')
+
+        #   FOR SPINBOX OF QUANTITY
+        def on_spinbox_change():
+            value = self.quantity_spinbox.get()
+        self.quantity_var = tk.StringVar()
+        quantity_label = tk.Label(input_frame, text='Quantity: ', bg=colors['bg_dark'], font=('Arial', 12), fg=colors['text_color']
+                                  )
+        #   SPINBOX VALIDATION COMMAND
+        vcmd = (self.root.register(self.validate_spinbox_input), '%P')
+
+        quantity_label.grid(row=3, column=0, sticky='w', padx=(0, 5), pady=8)
+        self.quantity_spinbox = tk.Spinbox(input_frame, from_=0, to=9999, width=10, repeatdelay=500, repeatinterval=100, font=('Arial', 12), validate='key', validatecommand=vcmd, command=on_spinbox_change)
+        self.quantity_spinbox.config(state='normal', cursor='hand2', bd=3, justify='center', wrap=True)
+        self.quantity_spinbox.grid(row=3, column=0, padx=140, pady=8, sticky='w')
+
+        vcmd_price = (self.root.register(self.validate_price_input), '%P')
+
+        self.unit_price_var = tk.StringVar()
+        price_label = tk.Label(input_frame, text='Unit Price: ', font=('Arial', 12), bg=colors['bg_dark'], fg=colors['text_color'])
+        price_label.grid(row=4, column=0, sticky='w', padx=(0, 130), pady=8)
+        price_entry = tk.Entry(input_frame, textvariable=self.unit_price_var, font=('Arial', 12), width=30, validate='key', validatecommand=vcmd_price)
+        price_entry.grid(row=4, column=0, sticky='ew', padx=(140, 5), pady=10, ipady=5)
+
+        #   BARCODE
+        self.generate_barcode_var = tk.StringVar()
+        barcode_label = tk.Label(input_frame, text='Barcode: ', bg=colors['bg_dark'], font=('Arial', 12), fg=colors['text_color'])
+        barcode_label.grid(row=5, column=0, sticky='w', padx=(0, 5), pady=8)
+
+        #   GENERATE BARCODE BUTTON
+        generate_btn = tk.Button(input_frame, text='Generate Barcode', font=('Arial', 12), activebackground=colors['accent_yellow'], command=self.generate_barcode)
+        generate_btn.grid(row=5, column=0, sticky='w', padx=140, pady=8)
+
+        #   BARCODE DISPLAY
+        self.barcode_label_image = tk.Label(input_frame)
+        self.barcode_label_image.grid(row=5, column=0, sticky='w', padx=140, pady=8)
+        self.barcode_label_image.grid_remove()
+
+        #   SEARCH BOX
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add('write', self.search)
+
+        #   UPLOAD IMAGE
+        self.upload_image_var = tk.StringVar()
+
+        self.barcode_dir = barcode_dir
+        os.makedirs(self.barcode_dir, exist_ok=True)
+
+        self.img_dir = img_dir
+        os.makedirs(self.img_dir, exist_ok=True)
+
+        img_label = tk.Label(input_frame, text='Item Image: ', bg=colors['bg_dark'], font=('Arial', 12), fg=colors['text_color'])
+        img_label.grid(row=6, column=0, sticky='w', padx=(0, 5), pady=8)
+
+        #   UPLOAD IMAGE BUTTON
+        self.uploadButton = tk.Button(input_frame, text='Upload Image', font=('Arial', 12), activebackground=colors['accent_yellow'], command=self.upload_image)
+        self.uploadButton.grid(row=6, column=0, sticky='w', padx=140, pady=8)
+
+        #   IMAGE DISPLAY
+        self.image_display = tk.Label(input_frame)
+        self.image_display.grid(row=6, column=0, sticky='w', padx=140, pady=8)
+        self.image_display.grid_remove()
+
+        #   BUTTON FRAME
+        button_frame = tk.Frame(left_frame, bg=colors['bg_dark'])
+        button_frame.pack(side='bottom', fill='x', pady=20, anchor='center')
+
+        # ADD, UPDATE, DELETE, CLEAR and EXPORT BUTTONS
+        btn_row = tk.Frame(button_frame, bg=colors['bg_dark'])
+        btn_row.pack(side='top')
+
+        tk.Button(btn_row, text='ADD', bg=colors['btn_green'], fg='white', width=10, height=2, font=('Arial', 10, 'bold'), activebackground=colors['accent_yellow'], activeforeground='white', command=self.add).pack(side='left', padx=(10, 8))
+        tk.Button(btn_row, text='UPDATE', bg=colors['btn_blue'], fg='white', width=10, height=2, font=('Arial', 10, 'bold'), activebackground=colors['accent_yellow'], activeforeground='white', command=self.update).pack(side='left', padx=8)
+        tk.Button(btn_row, text='DELETE', bg=colors['btn_red'], fg='white', width=10, height=2, font=('Arial', 10, 'bold'), activebackground=colors['accent_yellow'], activeforeground='white', command=self.delete).pack(side='left', padx=8)
+        tk.Button(btn_row, text='CLEAR', bg=colors['btn_white'], fg='white', width=10, height=2, font=('Arial', 10, 'bold'), activebackground=colors['accent_yellow'], activeforeground='white', command=self.clear).pack(side='left', padx=8)
+        tk.Button(btn_row, text='EXPORT TO PDF', bg=colors['btn_orange'], fg='black', width=15, height=2, font=('Arial', 10, 'bold'), activebackground=colors['accent_yellow'], activeforeground='white', command=self.export_to_pdf).pack(side='left', padx=(8, 10))
+
+        search_frame = tk.Frame(main_frame, bg=colors['bg_dark'])
+        search_frame.pack(fill='x', ipadx=10, ipady=5)
+
+        search_entry = tk.Entry(search_frame, textvariable=self.search_var, width=40)
+        search_entry.pack(side='right', padx=5)
+        search_entry.bind('<KeyRelease>', self.search)
+
+        tk.Label(search_frame, text='Search Item Name or Barcode: ', bg=colors['bg_dark'], font=('Arial', 11, 'italic')).pack(side='right', padx=5)
+
+        #   TABLE STYLE
+        table_style = ttk.Style()
+        table_style.configure('Treeview.Heading', font=('Arial', 10, 'bold'))
+        table_style.configure('Treeview', background=colors['btn_white'], foreground='black', rowheight=50, fieldbackground=colors['bg_light'])
+        table_style.map('Treeview', background=[('selected', colors['accent_yellow'])], foreground=[('selected', 'white')])
+
+        #   TABLE FRAME/ RIGHT FRAME
+        table_label = tk.Label(main_frame, text='ITEMS', bg=colors['bg_dark'], fg=colors['text_color'], font=('Arial', 14, 'bold'))
+        table_label.pack(fill='x')
+        table_frame = tk.Frame(main_frame, bg=colors['bg_dark'])
+        table_frame.pack(fill='both', expand=True, side='right')
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1, uniform='column_group')
+
+        #   TABLE COLUMNS
+        columns = ['Item ID', 'Item Name', 'Category', 'Qty', 'Price', 'Barcode']
+        self.table = ttk.Treeview(table_frame, columns=columns, show='headings')
+        self.table.heading('Item ID', text='Item ID')
+        self.table.heading('Item Name', text='Item Name')
+        self.table.heading('Category', text='Category')
+        self.table.heading('Qty', text='Qty')
+        self.table.heading('Price', text='Price')
+        self.table.heading('Barcode', text='Barcode')
+
+        self.table.column('Item ID', width=50, anchor='center')
+        self.table.column('Item Name', width=300, anchor='center')
+        self.table.column('Category', width=150, anchor='center')
+        self.table.column('Qty', width=50, anchor='center')
+        self.table.column('Price', width=50, anchor='center')
+        self.table.column('Barcode', width=80, anchor='center')
+
+        #   SCROLLBAR STYLE
+        scrollbar_style = ttk.Style()
+        scrollbar_style.configure('NoArrows.Vertical.TScrollbar', background=colors['header'], troughcolor=colors['header'], bordercolor=colors['header'], lightcolor=colors['header'], darkcolor=colors['header'], arrowcolor=colors['header'], gripcount=0)
+        scrollbar_style.layout('NoArrows.Vertical.TScrollbar', [('Vertical.Scrollbar.trough', {'children': [('Vertical.Scrollbar.thumb', {'expand': '1', 'sticky': 'nswe'})], 'sticky': 'ns'})])
+
+        #   SCROLLBAR
+        scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=self.table.yview, style='NoArrows.Vertical.TScrollbar')
+        scrollbar.grid(column=1, row=0, sticky='nsew')
+        scrollbar_style.map('NoArrows.Vertical.TScrollbar', background=[('active', colors['accent_yellow'])])
+
+        self.table.configure(yscrollcommand=scrollbar.set)
+        self.table.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
+
+        #   TREEVIEW TABLE DATA VIEW
+        self.view()
+
+        #   SELECTED DATA
+        def on_tree_select(event):
+            selected = self.table.selection()
+            if not selected:
+                return
+
+            values = self.table.item(selected[0], 'values')
+            if len(values) < 7:
+                return
+
+            item_id, name, category, qty, price, barcode_value, image_path = values
+
+            self.item_name_var.set(name)
+            self.category_var.set(category)
+            self.quantity_spinbox.delete(0, tk.END)
+            self.quantity_spinbox.insert(0, qty)
+            self.unit_price_var.set(price)
+            self.barcode_value = barcode_value
+
+            barcode_file = os.path.join(self.barcode_dir, f"{barcode_value}.png")
+            if os.path.exists(barcode_file):
+                img = Image.open(barcode_file).resize((150, 100), Image.Resampling.LANCZOS)
+                img_tk = ImageTk.PhotoImage(img)
+                self.barcode_label_image.config(image=img_tk)
+                self.barcode_label_image.image = img_tk
+                self.barcode_label_image.grid()
+                self.barcode_file_path = barcode_file
+            else:
+                self.barcode_label_image.config(image='')
+                self.barcode_label_image.image = None
+
+            if image_path and os.path.exists(image_path):
+                img = Image.open(image_path).resize((150, 150))
+                img.thumbnail((150, 150))
+                img_tk = ImageTk.PhotoImage(img)
+                self.image_display.config(image=img_tk)
+                self.image_display.image = img_tk
+                self.image_display.grid()
+                self.item_image_path = image_path
+            else:
+                self.image_display.config(image='')
+                self.image_display.image = None
+
+        #   DISPLAY SELECTED TREEVIEW DATA TO ENTRY WIDGETS
+        self.table.bind('<<TreeviewSelect>>', on_tree_select)
+
+    #   BARCODE GENERATOR
+    def resource_path(self, relative_path):
+        if hasattr(sys, '_MEIPASS'):
+            return os.path.join(sys._MEIPASS, relative_path)
+        return os.path.join(os.path.abspath('.'), relative_path)
+
+    def generate_barcode(self):
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT nextval('barcode_seq')")
+            barcode_value = str(cur.fetchone()[0])
+            conn.close()
+
+            font_path = self.resource_path('resources/fonts/DejaVuSansMono.ttf')
+
+            ean = barcode.get('ean13', barcode_value, writer=ImageWriter())
+            ean.writer.font_path = font_path
+            ean.writer.font_size = 14
+
+            filename = ean.save(os.path.join(self.barcode_dir, barcode_value))
+
+            img = Image.open(filename).resize((150, 100))
+            img_tk = ImageTk.PhotoImage(img)
+
+            self.barcode_label_image.config(image=img_tk)
+            self.barcode_label_image.image = img_tk
+            self.barcode_label_image.grid()
+
+            self.barcode_value = barcode_value
+            self.barcode_file_path = filename
+
+        except Exception as e:
+            messagebox.showerror('Barcode Error', f'Failed to generate barcode: {e}')
+
+    #   EXPORT TO PDF
+    def export_to_pdf(self):
+        try:
+            file_path = filedialog.asksaveasfilename(defaultextension='.pdf', filetypes=[('PDF files', '*.pdf')], title='Save PDF as')
+            if not file_path:
+                return
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            cur.execute('''SELECT item_id, item_name, category, quantity, unit_price, barcode, item_image FROM items''')
+            records = cur.fetchall()
+
+            conn.close()
+
+            pdf = FPDF('L', 'mm', 'Letter')
+            pdf.set_auto_page_break(auto=True, margin=5)
+            pdf.add_page()
+            pdf.set_font('Arial', 'B', 10)
+
+            # TABLE HEADERS
+            pdf.cell(20, 10, 'Item ID', 1)
+            pdf.cell(50, 10, 'Item Name', 1)
+            pdf.cell(40, 10, 'Category', 1)
+            pdf.cell(20, 10, 'Qty', 1)
+            pdf.cell(30, 10, 'Price', 1)
+            pdf.cell(50, 10, 'Barcode', 1)
+            pdf.cell(50, 10, 'Item Image', 1)
+            pdf.ln()
+
+            for record in records:
+                item_id, name, category, qty, price, barcode_path, image_path = record
+
+                pdf.cell(20, 20, str(item_id), 1)
+                pdf.cell(50, 20, name, 1)
+                pdf.cell(40, 20, category, 1)
+                pdf.cell(20, 20, str(qty), 1)
+                pdf.cell(30, 20, str(price), 1)
+
+                x = pdf.get_x()
+                y = pdf.get_y()
+                pdf.cell(50, 20, '', 1)
+
+                if barcode_path and os.path.exists(barcode_path):
+                    pdf.image(barcode_path, x + 5, y + 2, w=40, h=15)
+
+                x = pdf.get_x()
+                pdf.cell(50, 20, '', 1)
+
+                if image_path and os.path.exists(image_path):
+                    pdf.image(image_path, x + 5, y + 2, w=20, h=20)
+
+                pdf.ln(20)
+
+            pdf.output(file_path)
+            pdf_file = os.path.abspath(file_path)
+
+            messagebox.showinfo('Export Successful', f'PDF exported to {file_path}')
+
+            webbrowser.open(pdf_file)
+
+        except Exception as e:
+            messagebox.showerror('Export Error', f'Failed to export PDF: {e}')
+
+    #   LOGOUT
+    def logout(self):
+        login_win(root)
+
+    #   SEARCH BOX FUNCTION
+    def search(self, *args):
+        keyword = self.search_var.get().strip()
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        query = '''SELECT item_id, item_name, category, quantity, unit_price, barcode_value, item_image FROM items WHERE item_name ILIKE %s OR category ILIKE %s OR barcode_value::text ILIKE %s ORDER BY item_id'''
+
+        like = f'%{keyword}%'
+
+        cur.execute(query, (like, like, like))
+        records = cur.fetchall()
+
+        conn.close()
+
+        for row in self.table.get_children():
+            self.table.delete(row)
+
+        #   FOR STRIPED ROWS
+        self.table.tag_configure('oddrow', background='white')
+        self.table.tag_configure('evenrow', background=colors['bg_light'])
+
+        count = 0
+        for record in records:
+            tag = 'evenrow' if count % 2 == 0 else 'oddrow'
+            self.table.insert(parent='', index='end', values=record, tags=(tag,))
+            count += 1
+
+    # UPLOAD IMAGE
+    def upload_image(self):
+        filetypes = [('Image files', '*.png *.jpg *.jpeg')]
+        path = filedialog.askopenfilename(filetypes=filetypes)
+
+        if not path:
+            return
+
+        ext = os.path.splitext(path)[1]
+        filename = f'{uuid.uuid4().hex}{ext}'
+        dest_path = os.path.join(self.img_dir, filename)
+
+        shutil.copy(path, dest_path)
+
+        img = Image.open(dest_path).resize((150, 150))
+        img.thumbnail((150, 150))
+        self.current_item_image = ImageTk.PhotoImage(img)
+
+        self.image_display.config(image=self.current_item_image)
+        self.image_display.image = self.current_item_image
+        self.image_display.grid()
+
+        self.item_image_path = dest_path
+
+    #   CLEAR
+    def clear(self):
+        self.item_name_var.set('')
+        self.category_var.set('Select Category')
+        self.quantity_spinbox.delete(0, tk.END)
+        self.quantity_spinbox.insert(0, 0)
+        self.unit_price_var.set('')
+        self.barcode_label_image.config(image='')
+        self.barcode_label_image.image = None
+        self.barcode_value = None
+        self.barcode_file_path = None
+        self.image_display.config(image='')
+        self.image_display.image = None
+        self.item_image_path = None
+
+    #   CREATE/ ADD
+    def add(self):
+        try:
+            item_name = self.item_name_var.get().strip()
+            category = self.category_var.get()
+            quantity = self.quantity_spinbox.get()
+            unit_price = self.unit_price_var.get().strip()
+            barcode = getattr(self, 'barcode_value', None)
+            image_path = getattr(self, 'item_image_path', None)
+
+            if not item_name or category == 'Select Category' or not quantity or int(quantity) <= 0 or not unit_price or not barcode or not image_path:
+                messagebox.showwarning('Missing Input', 'All fields are required.')
+                return
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            cur.execute('''INSERT INTO items (item_name, category, quantity, unit_price, barcode_value, barcode, item_image) VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+        (
+                self.item_name_var.get().strip(),
+                self.category_var.get(),
+                int(self.quantity_spinbox.get()),
+                float(self.unit_price_var.get()),
+                self.barcode_value,
+                self.barcode_file_path,
+                getattr(self, 'item_image_path', None)
+            ))
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            messagebox.showinfo('Success', 'Item added successfully')
+
+            self.clear()
+            self.view()
+
+        except Exception as e:
+            messagebox.showerror('Add Error', str(e))
+
+    #   READ/ VIEW
+    def view(self):
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            cur.execute('''SELECT item_id, item_name, category, quantity, unit_price, barcode_value, item_image FROM items ORDER BY item_id''')
+            records = cur.fetchall()
+
+            for row in self.table.get_children():
+                self.table.delete(row)
+
+            #   FOR STRIPED ROWS
+            self.table.tag_configure('oddrow', background='white')
+            self.table.tag_configure('evenrow', background=colors['bg_light'])
+
+            count = 0
+            for record in records:
+                tag = 'evenrow' if count % 2 == 0 else 'oddrow'
+                self.table.insert(parent='', index='end', values=record, tags=(tag,))
+                count += 1
+
+            conn.close()
+
+        except Exception as e:
+            messagebox.showerror('View Error', f'Error viewing data: {e}')
+
+    #   UPDATE
+    def update(self):
+        try:
+            selected = self.table.selection()
+            if not selected:
+                messagebox.showwarning('Selection Error', 'Please select an item to update.')
+                return
+
+            values = self.table.item(selected[0], 'values')
+
+            item_id = values[0]
+            barcode_value = values[5]
+            image_path = values[6]
+
+            barcode_file = os.path.join(self.barcode_dir, f"{barcode_value}.png")
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            cur.execute('''UPDATE items SET item_name=%s, category=%s, quantity=%s, unit_price=%s, barcode=%s, item_image=%s WHERE item_id=%s''',
+        (
+                self.item_name_var.get().strip(),
+                self.category_var.get(),
+                int(self.quantity_spinbox.get()),
+                float(self.unit_price_var.get()),
+                barcode_file,
+                image_path,
+                item_id
+            ))
+
+            conn.commit()
+            conn.close()
+
+            self.clear()
+            self.view()
+
+            messagebox.showinfo('Success', 'Item updated successfully.')
+
+        except Exception as e:
+            messagebox.showerror('Update Error', str(e))
+
+    #   DELETE
+    def delete(self):
+        try:
+            selected_items = self.table.selection()
+            if not selected_items:
+                messagebox.showwarning('Selection Error', 'Please select an item to delete.')
+                return
+
+            confirm = messagebox.askyesno(
+                'Confirm Delete',
+                'Are you sure you want to delete the selected item(s)?'
+            )
+            if not confirm:
+                return
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            for iid in selected_items:
+                item_id = self.table.item(iid, 'values')[0]
+
+                cur.execute(
+                    "SELECT barcode, item_image FROM items WHERE item_id = %s",
+                    (item_id,)
+                )
+                records = cur.fetchone()
+
+                if records:
+                    barcode_path, image_path = records
+
+                    if barcode_path and os.path.exists(barcode_path):
+                        os.remove(barcode_path)
+
+                    if image_path and os.path.exists(image_path):
+                        os.remove(image_path)
+
+                cur.execute("DELETE FROM items WHERE item_id = %s", (item_id,))
+
+                self.table.delete(iid)
+
+            conn.commit()
+            conn.close()
+
+            self.clear()
+
+            messagebox.showinfo('Deletion Successful', 'Selected item(s) have been successfully deleted.'
+            )
+
+        except Exception as e:
+            messagebox.showerror('Delete Error', f'Error deleting the item: {e}')
+
+#   WINDOW FOR INVENTORY SYSTEM
+def inventory(root, first_name, last_name):
+    for widget in root.winfo_children():
+        widget.destroy()
+    SchoolSuppliesInventorySystem(root, first_name, last_name)
+
+def login_win(root):
+    for widget in root.winfo_children():
+        widget.destroy()
+    LoginAdmin(root, on_success=lambda fn, ln: inventory(root, fn, ln))
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    ttk.Style().theme_use('clam')
+    startup(root)
+    login_win(root)
+    root.mainloop()
